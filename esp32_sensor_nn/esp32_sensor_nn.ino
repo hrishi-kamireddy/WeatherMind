@@ -1,22 +1,23 @@
 /*
  * ═══════════════════════════════════════════════════════════════
- * WeatherMind — ESP32 NN Predictor + Weather Classifier + BLE
+ * WeatherMind — ESP32 NN Predictor + BLE (Light Sleep)
  * ═══════════════════════════════════════════════════════════════
  *
- * OLED is on 3.3V (always powered, even during deep sleep).
- * The last prediction stays visible on screen while sleeping.
+ * Light sleep mode: ESP32 rests at ~2-5mA between cycles.
+ * BLE stays alive — phone can connect anytime.
+ * OLED stays on (powered by 3.3V).
  *
  * Each cycle:
- *   1. Wake up, power on sensors via GPIO 15
- *   2. Collect 12 readings over ~1 minute (5s intervals)
- *   3. Run NN -> predict 30 min ahead -> classify weather
- *   4. Update OLED with current + predicted + weather type
- *   5. BLE broadcast for 15 seconds
- *   6. Power off sensors, deep sleep
- *   7. OLED keeps showing results (it stays powered)
+ *   1. Wake from light sleep
+ *   2. Power on sensors via GPIO 15
+ *   3. Collect 12 readings over ~1 minute (5s intervals)
+ *   4. Run NN -> predict 30 min ahead -> classify weather
+ *   5. Update OLED + notify connected BLE devices
+ *   6. Power off sensors
+ *   7. Light sleep (BLE stays on, OLED stays on)
  *
- * SLEEP TIME:
- *   Currently set to 1 minute for testing.
+ * CYCLE TIME:
+ *   Currently set to 1 minute sleep for testing.
  *   For production, change SLEEP_MINUTES from 1 to 29.
  *
  * NN: 48 -> 16 (ReLU) -> 8 (ReLU) -> 4 (Sigmoid)
@@ -47,9 +48,8 @@
 #define LIGHT_PIN        2
 
 // ─── Timing ──────────────────────────────────────────────────
-#define SAMPLE_INTERVAL_MS 5000   // 5s between readings
-#define NUM_SAMPLES        12     // 12 readings = ~1 minute
-#define BLE_WINDOW_SECONDS 15     // BLE advertising window
+#define SAMPLE_INTERVAL_MS 5000
+#define NUM_SAMPLES        12
 
 // ┌─────────────────────────────────────────────────────────┐
 // │  SLEEP TIME: Change this to 29 for production           │
@@ -68,9 +68,14 @@ DHT dht(DHT_PIN, DHT11);
 Adafruit_BMP085 bmp;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ─── RTC memory (survives deep sleep) ────────────────────────
-RTC_DATA_ATTR int  wakeCount = 0;
-RTC_DATA_ATTR char prevAlertType[20] = "UNKNOWN";
+// ─── BLE objects (persist across light sleep) ────────────────
+BLEServer*         pServer        = nullptr;
+BLECharacteristic* pCurrentChar   = nullptr;
+BLECharacteristic* pPredictedChar = nullptr;
+BLECharacteristic* pStatusChar    = nullptr;
+BLECharacteristic* pAlertChar     = nullptr;
+bool deviceConnected    = false;
+bool oldDeviceConnected = false;
 
 // ─── NN buffers ──────────────────────────────────────────────
 float sensorBuffer[NN_LOOKBACK][4];
@@ -79,12 +84,15 @@ float hidden1Buf[NN_HIDDEN1];
 float hidden2Buf[NN_HIDDEN2];
 float outputBuf[NN_OUTPUT_DIM];
 
-// ─── Current + predicted values ──────────────────────────────
-float curTemp, curHum, curPres, curLux;
-float predTemp, predHum, predPres, predLux;
-const char* weatherName   = "UNKNOWN";
-const char* weatherDetail = "";
+// ─── State ───────────────────────────────────────────────────
+float curTemp = 0, curHum = 0, curPres = 0, curLux = 0;
+float predTemp = 0, predHum = 0, predPres = 0, predLux = 0;
+const char* weatherName   = "WAITING";
+const char* weatherDetail = "First reading pending";
 int         weatherSev    = 0;
+bool        hasPrediction = false;
+int         cycleCount    = 0;
+String      prevAlertType = "UNKNOWN";
 
 // ═══════════════════════════════════════════════════════════════
 //  Weather Classification
@@ -122,6 +130,20 @@ WeatherResult classifyWeather(float tempC, float humPct, float pressPa, float lu
 
     return {"CLEAR", "No severe weather detected", 0};
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  BLE callbacks
+// ═══════════════════════════════════════════════════════════════
+class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* s) override {
+        deviceConnected = true;
+        Serial.println("BLE: Device connected");
+    }
+    void onDisconnect(BLEServer* s) override {
+        deviceConnected = false;
+        Serial.println("BLE: Device disconnected");
+    }
+};
 
 // ═══════════════════════════════════════════════════════════════
 //  NN math
@@ -170,100 +192,123 @@ bool readSensors(float* temp, float* hum, float* pres, float* lux) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update OLED with final results (stays visible during sleep)
+//  Update OLED (stays visible during sleep)
 // ═══════════════════════════════════════════════════════════════
 void updateOLED() {
     display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+
+    // ── Current values ───────────────────────────
+    display.setTextSize(1);
     display.setCursor(0, 0);
+    display.print("NOW");
 
-    // Line 1: current temp + humidity
-    display.print("Now T:");
+    display.setCursor(0, 10);
+    display.print("T:");
     display.print(curTemp, 1);
-    display.print("C H:");
+    display.print("C  H:");
     display.print(curHum, 0);
-    display.println("%");
+    display.print("%");
 
-    // Line 2: current pressure + light
+    display.setCursor(0, 20);
     display.print("P:");
     display.print(curPres, 0);
     display.print(" L:");
-    display.println((int)curLux);
+    display.print((int)curLux);
 
-    // Line 3: separator
-    display.println("--- Forecast 30m ---");
+    // ── Separator ────────────────────────────────
+    display.drawLine(0, 30, 127, 30, SSD1306_WHITE);
 
-    // Line 4: weather classification
-    display.print(">> ");
-    display.println(weatherName);
-
-    // Line 5: predicted temp + humidity
-    display.print("pT:");
+    // ── Forecast ─────────────────────────────────
+    display.setTextSize(1);
+    display.setCursor(0, 34);
+    display.print("30m: ");
     display.print(predTemp, 1);
-    display.print("C pH:");
-    display.print(predHum, 0);
-    display.println("%");
+    display.print("C");
 
-    // Line 6: predicted pressure + severity
-    display.print("pP:");
-    display.print(predPres, 0);
-    display.print(" Sev:");
-    display.println(weatherSev);
+    // Weather type large
+    display.setTextSize(2);
+    display.setCursor(0, 46);
+    display.print(weatherName);
 
     display.display();
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  SETUP (runs every wake from deep sleep)
+//  Update BLE characteristics
 // ═══════════════════════════════════════════════════════════════
-void setup() {
-    Serial.begin(115200);
-    wakeCount++;
+void updateBLE() {
+    char buf[80];
 
+    // Current values
+    snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.0f", curTemp, curHum, curPres, curLux);
+    pCurrentChar->setValue(buf);
+    if (deviceConnected) pCurrentChar->notify();
+
+    if (!hasPrediction) return;
+
+    // Predicted values
+    snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.1f", predTemp, predHum, predPres, predLux);
+    pPredictedChar->setValue(buf);
+    if (deviceConnected) pPredictedChar->notify();
+
+    // Weather status
+    char statusBuf[120];
+    snprintf(statusBuf, sizeof(statusBuf), "%s|%d|%s", weatherName, weatherSev, weatherDetail);
+    pStatusChar->setValue(statusBuf);
+    if (deviceConnected) pStatusChar->notify();
+
+    // Alert on weather change
+    if (String(weatherName) != prevAlertType) {
+        char alertBuf[120];
+        if (weatherSev >= 2)
+            snprintf(alertBuf, sizeof(alertBuf), "ALERT:%s|%s", weatherName, weatherDetail);
+        else
+            snprintf(alertBuf, sizeof(alertBuf), "OK:%s|%s", weatherName, weatherDetail);
+        pAlertChar->setValue(alertBuf);
+        if (deviceConnected) pAlertChar->notify();
+        Serial.printf(">>> BLE ALERT: %s\n", alertBuf);
+        prevAlertType = String(weatherName);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Collect data + run NN + update everything
+// ═══════════════════════════════════════════════════════════════
+void runCycle() {
+    cycleCount++;
     Serial.printf("\n=========================================\n");
-    Serial.printf("  WeatherMind - wake #%d\n", wakeCount);
-    Serial.printf("  Sleep time: %d min\n", SLEEP_MINUTES);
+    Serial.printf("  WeatherMind - cycle #%d\n", cycleCount);
     Serial.printf("=========================================\n");
 
-    // ── Power on sensors (OLED is on 3.3V, always powered) ──
-    pinMode(SENSOR_POWER_PIN, OUTPUT);
+    // ── Power on sensors ─────────────────────────────────────
     digitalWrite(SENSOR_POWER_PIN, HIGH);
     delay(3000);
 
-    // ── Init I2C + sensors ───────────────────────────────────
+    // ── Re-init sensors (they were powered off) ──────────────
     Wire.begin(21, 22);
     dht.begin();
-    analogReadResolution(12);
-    pinMode(LIGHT_PIN, INPUT);
 
     if (!bmp.begin()) {
         Serial.println("BMP180 not found!");
-        while (1) delay(10);
+        return;
     }
 
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("OLED not found!");
-        while (1) delay(10);
-    }
-
-    // ── Show collecting status ───────────────────────────────
+    // ── Show collecting on OLED ──────────────────────────────
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println("WeatherMind");
-    display.println();
     display.println("Collecting data...");
     display.println("12 readings / 1 min");
     display.display();
 
-    // ── Flush DHT11 startup junk ─────────────────────────────
+    // ── Flush DHT11 ──────────────────────────────────────────
     dht.readTemperature();
     dht.readHumidity();
     delay(2500);
 
-    // ═════════════════════════════════════════════════════════
-    //  COLLECT 12 READINGS OVER ~1 MINUTE
-    // ═════════════════════════════════════════════════════════
+    // ── Collect 12 readings ──────────────────────────────────
     int samplesCollected = 0;
 
     for (int s = 0; s < NUM_SAMPLES; s++) {
@@ -290,10 +335,8 @@ void setup() {
         // Progress on OLED
         display.clearDisplay();
         display.setCursor(0, 0);
-        display.println("Collecting...");
-        display.printf("Sample %d / %d\n", s + 1, NUM_SAMPLES);
+        display.printf("Collecting %d/%d\n", s + 1, NUM_SAMPLES);
         if (samplesCollected > 0) {
-            display.println();
             display.printf("T:%.1fC H:%.1f%%\n", curTemp, curHum);
             display.printf("P:%.0fPa L:%.0f\n", curPres, curLux);
         }
@@ -303,11 +346,7 @@ void setup() {
             delay(SAMPLE_INTERVAL_MS);
     }
 
-    Serial.printf("Collected %d samples\n", samplesCollected);
-
-    // ═════════════════════════════════════════════════════════
-    //  NN INFERENCE
-    // ═════════════════════════════════════════════════════════
+    // ── NN inference ─────────────────────────────────────────
     if (samplesCollected >= NUM_SAMPLES / 2) {
         for (int s = 0; s < NN_LOOKBACK; s++)
             for (int f = 0; f < 4; f++)
@@ -324,6 +363,7 @@ void setup() {
         weatherName   = w.name;
         weatherDetail = w.detail;
         weatherSev    = w.severity;
+        hasPrediction = true;
 
         const char* sevLabel[] = {"OK", "MILD", "MODERATE", "SEVERE"};
         Serial.println("────────────────────────────────────────");
@@ -338,82 +378,105 @@ void setup() {
         weatherSev = 0;
     }
 
-    // ═════════════════════════════════════════════════════════
-    //  UPDATE OLED (stays visible during sleep)
-    // ═════════════════════════════════════════════════════════
-    updateOLED();
+    // ── Power off sensors ────────────────────────────────────
+    digitalWrite(SENSOR_POWER_PIN, LOW);
 
-    // ═════════════════════════════════════════════════════════
-    //  BLE BROADCAST
-    // ═════════════════════════════════════════════════════════
+    // ── Update OLED + BLE ────────────────────────────────────
+    updateOLED();
+    updateBLE();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SETUP (runs once on boot)
+// ═══════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    pinMode(SENSOR_POWER_PIN, OUTPUT);
+    digitalWrite(SENSOR_POWER_PIN, LOW);
+
+    analogReadResolution(12);
+    pinMode(LIGHT_PIN, INPUT);
+
+    // ── Init OLED ────────────────────────────────────────────
+    Wire.begin(21, 22);
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println("OLED not found!");
+        while (1) delay(10);
+    }
+
+    // ── Boot screen ──────────────────────────────────────────
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 15);
+    display.println("  WeatherMind");
+    display.setCursor(0, 30);
+    display.println(" by Shadow Mechanics");
+    display.display();
+    delay(3000);
+
+    // ── Init BLE (stays on forever) ──────────────────────────
     BLEDevice::init("WeatherMind");
-    BLEServer* pServer = BLEDevice::createServer();
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
     BLEService* pService = pServer->createService(SERVICE_UUID);
 
-    BLECharacteristic* pCurChar = pService->createCharacteristic(
+    pCurrentChar = pService->createCharacteristic(
         CHAR_CURRENT_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pCurChar->addDescriptor(new BLE2902());
+    pCurrentChar->addDescriptor(new BLE2902());
 
-    BLECharacteristic* pPredChar = pService->createCharacteristic(
+    pPredictedChar = pService->createCharacteristic(
         CHAR_PREDICTED_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pPredChar->addDescriptor(new BLE2902());
+    pPredictedChar->addDescriptor(new BLE2902());
 
-    BLECharacteristic* pStatChar = pService->createCharacteristic(
+    pStatusChar = pService->createCharacteristic(
         CHAR_WEATHER_STATUS_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pStatChar->addDescriptor(new BLE2902());
+    pStatusChar->addDescriptor(new BLE2902());
 
-    BLECharacteristic* pAlertChar = pService->createCharacteristic(
+    pAlertChar = pService->createCharacteristic(
         CHAR_ALERT_UUID,
         BLECharacteristic::PROPERTY_NOTIFY);
     pAlertChar->addDescriptor(new BLE2902());
 
     pService->start();
+
     BLEAdvertising* pAdv = BLEDevice::getAdvertising();
     pAdv->addServiceUUID(SERVICE_UUID);
     pAdv->setScanResponse(true);
+    pAdv->setMinPreferred(0x06);
     BLEDevice::startAdvertising();
-    Serial.println("BLE: Advertising as 'WeatherMind'");
 
-    char buf[80];
-    snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.0f", curTemp, curHum, curPres, curLux);
-    pCurChar->setValue(buf);
+    Serial.println("BLE: Always on, advertising as 'WeatherMind'");
 
-    snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.1f", predTemp, predHum, predPres, predLux);
-    pPredChar->setValue(buf);
-
-    char statusBuf[120];
-    snprintf(statusBuf, sizeof(statusBuf), "%s|%d|%s", weatherName, weatherSev, weatherDetail);
-    pStatChar->setValue(statusBuf);
-
-    if (strcmp(weatherName, prevAlertType) != 0) {
-        char alertBuf[120];
-        if (weatherSev >= 2)
-            snprintf(alertBuf, sizeof(alertBuf), "ALERT:%s|%s", weatherName, weatherDetail);
-        else
-            snprintf(alertBuf, sizeof(alertBuf), "OK:%s|%s", weatherName, weatherDetail);
-        pAlertChar->setValue(alertBuf);
-        Serial.printf(">>> BLE ALERT: %s\n", alertBuf);
-        strncpy(prevAlertType, weatherName, sizeof(prevAlertType) - 1);
-    }
-
-    // BLE connection window
-    Serial.printf("BLE window: %ds\n", BLE_WINDOW_SECONDS);
-    delay(BLE_WINDOW_SECONDS * 1000);
-
-    // ═════════════════════════════════════════════════════════
-    //  DEEP SLEEP (OLED stays on — powered by 3.3V)
-    // ═════════════════════════════════════════════════════════
-    BLEDevice::deinit(true);
-    digitalWrite(SENSOR_POWER_PIN, LOW);  // only sensors off, not OLED
-
-    Serial.printf("Sleeping %d min (OLED stays on)...\n", SLEEP_MINUTES);
-    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60ULL * 1000000ULL);
-    esp_deep_sleep_start();
+    // ── Run first cycle immediately ──────────────────────────
+    runCycle();
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  LOOP (light sleep between cycles)
+// ═══════════════════════════════════════════════════════════════
 void loop() {
-    // Empty — deep sleep always reboots into setup()
+    // Handle BLE reconnection
+    if (!deviceConnected && oldDeviceConnected) {
+        delay(500);
+        BLEDevice::startAdvertising();
+        Serial.println("BLE: Restarted advertising");
+    }
+    oldDeviceConnected = deviceConnected;
+
+    // Light sleep for SLEEP_MINUTES
+    // esp_sleep_enable_timer_wakeup keeps BLE alive
+    Serial.printf("Light sleep %d min (BLE stays on)...\n", SLEEP_MINUTES);
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60ULL * 1000000ULL);
+    esp_light_sleep_start();
+
+    // Woke up — run next cycle
+    Serial.println("Woke from light sleep");
+    runCycle();
 }
