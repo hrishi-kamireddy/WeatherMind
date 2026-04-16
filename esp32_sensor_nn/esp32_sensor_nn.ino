@@ -1,24 +1,26 @@
 /*
  * ═══════════════════════════════════════════════════════════════
- * WeatherMind — ESP32 NN Predictor + BLE (Light Sleep)
+ * WeatherMind — ESP32 NN + BLE + ESP-NOW (Light Sleep)
  * ═══════════════════════════════════════════════════════════════
  *
- * Light sleep mode: ESP32 rests at ~2-5mA between cycles.
- * BLE stays alive — phone can connect anytime.
- * OLED stays on (powered by 3.3V).
+ * Light sleep: BLE stays alive, phone connects anytime.
+ * ESP-NOW: broadcasts weather to nearby ESP32s.
  *
  * Each cycle:
  *   1. Wake from light sleep
- *   2. Power on sensors via GPIO 15
- *   3. Collect 12 readings over ~1 minute (5s intervals)
- *   4. Run NN -> predict 30 min ahead -> classify weather
- *   5. Update OLED + notify connected BLE devices
- *   6. Power off sensors
- *   7. Light sleep (BLE stays on, OLED stays on)
+ *   2. Power on sensors, collect 12 readings (~1 min)
+ *   3. NN inference -> classify weather
+ *   4. Update OLED + notify BLE + broadcast ESP-NOW
+ *   5. Power off sensors, light sleep
  *
- * CYCLE TIME:
- *   Currently set to 1 minute sleep for testing.
+ * SLEEP TIME:
+ *   Currently 1 minute for testing.
  *   For production, change SLEEP_MINUTES from 1 to 29.
+ *
+ * ESP-NOW SETUP:
+ *   Change peerAddress to the other ESP32's MAC address.
+ *   Use 0xFF x6 to broadcast to all nearby ESP32s.
+ *   Each board needs a unique DEVICE_NAME.
  *
  * NN: 48 -> 16 (ReLU) -> 8 (ReLU) -> 4 (Sigmoid)
  * ═══════════════════════════════════════════════════════════════
@@ -35,6 +37,12 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ─── Device Identity ─────────────────────────────────────────
+// Change this on each board so you know who sent what
+#define DEVICE_NAME "WM-Station1"
 
 // ─── Display ─────────────────────────────────────────────────
 #define SCREEN_WIDTH 128
@@ -63,12 +71,38 @@
 #define CHAR_WEATHER_STATUS_UUID  "e3a1f0b0-1234-5678-abcd-000000000004"
 #define CHAR_ALERT_UUID           "e3a1f0b0-1234-5678-abcd-000000000005"
 
+// ─── ESP-NOW Peer ────────────────────────────────────────────
+// Set to the OTHER ESP32's MAC address.
+// Use FF:FF:FF:FF:FF:FF to broadcast to ALL nearby ESP32s.
+// Find your MAC in Serial Monitor at boot.
+uint8_t peerAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ─── ESP-NOW Message Structure ───────────────────────────────
+#define MSG_TYPE_WEATHER 1
+#define MSG_TYPE_TEXT    2
+
+typedef struct {
+    uint8_t  msgType;          // 1 = weather, 2 = text
+    char     senderName[16];   // device name
+    char     weatherName[20];  // classification
+    int      severity;         // 0-3
+    float    temperature;      // predicted temp
+    float    humidity;         // predicted humidity
+    float    pressure;         // predicted pressure
+    float    lux;              // predicted lux
+    char     textMsg[64];      // custom text message
+} EspNowMessage;
+
+EspNowMessage outgoingMsg;
+EspNowMessage incomingMsg;
+volatile bool newMessageReceived = false;
+
 // ─── Sensor objects ──────────────────────────────────────────
 DHT dht(DHT_PIN, DHT11);
 Adafruit_BMP085 bmp;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ─── BLE objects (persist across light sleep) ────────────────
+// ─── BLE objects ─────────────────────────────────────────────
 BLEServer*         pServer        = nullptr;
 BLECharacteristic* pCurrentChar   = nullptr;
 BLECharacteristic* pPredictedChar = nullptr;
@@ -132,7 +166,47 @@ WeatherResult classifyWeather(float tempC, float humPct, float pressPa, float lu
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  BLE callbacks
+//  ESP-NOW Callbacks
+// ═══════════════════════════════════════════════════════════════
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.printf("ESP-NOW send: %s\n",
+                  status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+    if (len > sizeof(incomingMsg)) len = sizeof(incomingMsg);
+    memcpy(&incomingMsg, data, len);
+    newMessageReceived = true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ESP-NOW Send Functions
+// ═══════════════════════════════════════════════════════════════
+void sendWeatherESPNow() {
+    memset(&outgoingMsg, 0, sizeof(outgoingMsg));
+    outgoingMsg.msgType = MSG_TYPE_WEATHER;
+    strncpy(outgoingMsg.senderName, DEVICE_NAME, 15);
+    strncpy(outgoingMsg.weatherName, weatherName, 19);
+    outgoingMsg.severity    = weatherSev;
+    outgoingMsg.temperature = predTemp;
+    outgoingMsg.humidity    = predHum;
+    outgoingMsg.pressure    = predPres;
+    outgoingMsg.lux         = predLux;
+
+    esp_now_send(peerAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
+}
+
+void sendTextESPNow(const char* message) {
+    memset(&outgoingMsg, 0, sizeof(outgoingMsg));
+    outgoingMsg.msgType = MSG_TYPE_TEXT;
+    strncpy(outgoingMsg.senderName, DEVICE_NAME, 15);
+    strncpy(outgoingMsg.textMsg, message, 63);
+
+    esp_now_send(peerAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  BLE Callbacks
 // ═══════════════════════════════════════════════════════════════
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* s) override {
@@ -146,7 +220,7 @@ class ServerCallbacks : public BLEServerCallbacks {
 };
 
 // ═══════════════════════════════════════════════════════════════
-//  NN math
+//  NN Math
 // ═══════════════════════════════════════════════════════════════
 static inline float pgm_float(const float* addr) {
     float v; memcpy_P(&v, addr, sizeof(float)); return v;
@@ -180,7 +254,7 @@ float denormalizeVal(float n, int i) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Read sensors
+//  Read Sensors
 // ═══════════════════════════════════════════════════════════════
 bool readSensors(float* temp, float* hum, float* pres, float* lux) {
     *temp = dht.readTemperature();
@@ -192,13 +266,12 @@ bool readSensors(float* temp, float* hum, float* pres, float* lux) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update OLED (stays visible during sleep)
+//  Update OLED
 // ═══════════════════════════════════════════════════════════════
 void updateOLED() {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
-    // ── Current values ───────────────────────────
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.print("NOW");
@@ -216,17 +289,14 @@ void updateOLED() {
     display.print(" L:");
     display.print((int)curLux);
 
-    // ── Separator ────────────────────────────────
     display.drawLine(0, 30, 127, 30, SSD1306_WHITE);
 
-    // ── Forecast ─────────────────────────────────
     display.setTextSize(1);
     display.setCursor(0, 34);
     display.print("30m: ");
     display.print(predTemp, 1);
     display.print("C");
 
-    // Weather type large
     display.setTextSize(2);
     display.setCursor(0, 46);
     display.print(weatherName);
@@ -235,30 +305,55 @@ void updateOLED() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update BLE characteristics
+//  Show incoming ESP-NOW message on OLED
+// ═══════════════════════════════════════════════════════════════
+void showIncomingMessage() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+
+    if (incomingMsg.msgType == MSG_TYPE_WEATHER) {
+        display.println("== INCOMING ==");
+        display.printf("From: %s\n", incomingMsg.senderName);
+        display.println();
+        display.setTextSize(2);
+        display.println(incomingMsg.weatherName);
+        display.setTextSize(1);
+        display.printf("Sev:%d T:%.1fC\n", incomingMsg.severity, incomingMsg.temperature);
+    } else {
+        display.println("== MESSAGE ==");
+        display.printf("From: %s\n", incomingMsg.senderName);
+        display.println();
+        display.println(incomingMsg.textMsg);
+    }
+
+    display.display();
+    delay(5000);
+    updateOLED();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Update BLE
 // ═══════════════════════════════════════════════════════════════
 void updateBLE() {
     char buf[80];
 
-    // Current values
     snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.0f", curTemp, curHum, curPres, curLux);
     pCurrentChar->setValue(buf);
     if (deviceConnected) pCurrentChar->notify();
 
     if (!hasPrediction) return;
 
-    // Predicted values
     snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.1f", predTemp, predHum, predPres, predLux);
     pPredictedChar->setValue(buf);
     if (deviceConnected) pPredictedChar->notify();
 
-    // Weather status
     char statusBuf[120];
     snprintf(statusBuf, sizeof(statusBuf), "%s|%d|%s", weatherName, weatherSev, weatherDetail);
     pStatusChar->setValue(statusBuf);
     if (deviceConnected) pStatusChar->notify();
 
-    // Alert on weather change
     if (String(weatherName) != prevAlertType) {
         char alertBuf[120];
         if (weatherSev >= 2)
@@ -273,7 +368,7 @@ void updateBLE() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Collect data + run NN + update everything
+//  Run Full Cycle: collect -> predict -> display -> broadcast
 // ═══════════════════════════════════════════════════════════════
 void runCycle() {
     cycleCount++;
@@ -285,7 +380,7 @@ void runCycle() {
     digitalWrite(SENSOR_POWER_PIN, HIGH);
     delay(3000);
 
-    // ── Re-init sensors (they were powered off) ──────────────
+    // ── Re-init sensors ──────────────────────────────────────
     Wire.begin(21, 22);
     dht.begin();
 
@@ -294,7 +389,7 @@ void runCycle() {
         return;
     }
 
-    // ── Show collecting on OLED ──────────────────────────────
+    // ── Show collecting ──────────────────────────────────────
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -342,6 +437,13 @@ void runCycle() {
         }
         display.display();
 
+        // Check for incoming ESP-NOW during collection
+        if (newMessageReceived) {
+            newMessageReceived = false;
+            Serial.printf("ESP-NOW received from %s during collection\n",
+                          incomingMsg.senderName);
+        }
+
         if (s < NUM_SAMPLES - 1)
             delay(SAMPLE_INTERVAL_MS);
     }
@@ -381,9 +483,14 @@ void runCycle() {
     // ── Power off sensors ────────────────────────────────────
     digitalWrite(SENSOR_POWER_PIN, LOW);
 
-    // ── Update OLED + BLE ────────────────────────────────────
+    // ── Update everything ────────────────────────────────────
     updateOLED();
     updateBLE();
+
+    // ── Broadcast to other ESP32s ────────────────────────────
+    if (hasPrediction) {
+        sendWeatherESPNow();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -395,7 +502,6 @@ void setup() {
 
     pinMode(SENSOR_POWER_PIN, OUTPUT);
     digitalWrite(SENSOR_POWER_PIN, LOW);
-
     analogReadResolution(12);
     pinMode(LIGHT_PIN, INPUT);
 
@@ -416,6 +522,29 @@ void setup() {
     display.println(" by Shadow Mechanics");
     display.display();
     delay(3000);
+
+    // ── Init ESP-NOW ─────────────────────────────────────────
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed!");
+    } else {
+        esp_now_register_send_cb(onDataSent);
+        esp_now_register_recv_cb(onDataRecv);
+
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, peerAddress, 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
+
+        Serial.println("ESP-NOW: Ready");
+        Serial.printf("ESP-NOW: Device name '%s'\n", DEVICE_NAME);
+    }
+
+    // Print MAC address for pairing
+    Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
 
     // ── Init BLE (stays on forever) ──────────────────────────
     BLEDevice::init("WeatherMind");
@@ -459,7 +588,7 @@ void setup() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  LOOP (light sleep between cycles)
+//  LOOP (light sleep between cycles, BLE stays alive)
 // ═══════════════════════════════════════════════════════════════
 void loop() {
     // Handle BLE reconnection
@@ -470,13 +599,30 @@ void loop() {
     }
     oldDeviceConnected = deviceConnected;
 
-    // Light sleep for SLEEP_MINUTES
-    // esp_sleep_enable_timer_wakeup keeps BLE alive
-    Serial.printf("Light sleep %d min (BLE stays on)...\n", SLEEP_MINUTES);
+    // Handle incoming ESP-NOW messages
+    if (newMessageReceived) {
+        newMessageReceived = false;
+
+        if (incomingMsg.msgType == MSG_TYPE_WEATHER) {
+            Serial.printf("ESP-NOW from %s: %s [sev:%d] T:%.1fC\n",
+                          incomingMsg.senderName,
+                          incomingMsg.weatherName,
+                          incomingMsg.severity,
+                          incomingMsg.temperature);
+        } else {
+            Serial.printf("ESP-NOW msg from %s: %s\n",
+                          incomingMsg.senderName,
+                          incomingMsg.textMsg);
+        }
+
+        showIncomingMessage();
+    }
+
+    // Light sleep — BLE stays alive
+    Serial.printf("Light sleep %d min...\n", SLEEP_MINUTES);
     esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60ULL * 1000000ULL);
     esp_light_sleep_start();
 
-    // Woke up — run next cycle
     Serial.println("Woke from light sleep");
     runCycle();
 }
