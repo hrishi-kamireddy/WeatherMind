@@ -73,13 +73,23 @@ print(f"Prediction horizon: {PREDICTION_STEP} steps (~{PREDICTION_STEP * 5 / 60:
 # ─── 4. Normalize ────────────────────────────────────────────
 feat_min = data.min(axis=0)
 feat_max = data.max(axis=0)
+# --- ADD THESE MANUALLY ---
+# Force Lux (index 3) to a realistic indoor range (0 to 4095 lux)
+feat_min[3] = 0.0
+feat_max[3] = 4095.0
+# --------------------------
+
 feat_range = feat_max - feat_min
 feat_range[feat_range == 0] = 1.0
 
 data_norm = (data - feat_min) / feat_range
+# feat_range = feat_max - feat_min
+# feat_range[feat_range == 0] = 1.0
 
-print(f"Feature mins:   {feat_min}")
-print(f"Feature maxes:  {feat_max}")
+# data_norm = (data - feat_min) / feat_range
+
+# print(f"Feature mins:   {feat_min}")
+# print(f"Feature maxes:  {feat_max}")
 
 # ─── 5. Create sequences ─────────────────────────────────────
 print("\n" + "=" * 60)
