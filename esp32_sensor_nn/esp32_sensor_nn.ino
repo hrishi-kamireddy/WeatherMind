@@ -1,31 +1,3 @@
-/*
- * ═══════════════════════════════════════════════════════════════
- * WeatherMind — ESP32 NN + BLE + ESP-NOW (Light Sleep)
- * ═══════════════════════════════════════════════════════════════
- *
- * Light sleep: BLE stays alive, phone connects anytime.
- * ESP-NOW: broadcasts weather to nearby ESP32s.
- *
- * Each cycle:
- *   1. Wake from light sleep
- *   2. Power on sensors, collect 12 readings (~1 min)
- *   3. NN inference -> classify weather
- *   4. Update OLED + notify BLE + broadcast ESP-NOW
- *   5. Power off sensors, light sleep
- *
- * SLEEP TIME:
- *   Currently 1 minute for testing.
- *   For production, change SLEEP_MINUTES from 1 to 29.
- *
- * ESP-NOW SETUP:
- *   Change peerAddress to the other ESP32's MAC address.
- *   Use 0xFF x6 to broadcast to all nearby ESP32s.
- *   Each board needs a unique DEVICE_NAME.
- *
- * NN: 48 -> 16 (ReLU) -> 8 (ReLU) -> 4 (Sigmoid)
- * ═══════════════════════════════════════════════════════════════
- */
-
 #include "nn_weights.h"
 
 #include <DHT.h>
@@ -37,213 +9,172 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <esp_now.h>
-#include <WiFi.h>
+#include <Preferences.h>
+#include <math.h>
 
-// ─── Device Identity ─────────────────────────────────────────
-// Change this on each board so you know who sent what
-#define DEVICE_NAME "WM-Station1"
+#define NN_HIDDEN1 16
+#define NN_HIDDEN2 8
+#define NN_FEATURES 4
 
-// ─── Display ─────────────────────────────────────────────────
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
-// ─── Pins ────────────────────────────────────────────────────
 #define SENSOR_POWER_PIN 15
-#define DHT_PIN          4
-#define LIGHT_PIN        2
+#define DHT_PIN 4
+#define LIGHT_PIN 2
 
-// ─── Timing ──────────────────────────────────────────────────
 #define SAMPLE_INTERVAL_MS 5000
-#define NUM_SAMPLES        12
+#define NUM_SAMPLES 12
+#define BLE_WINDOW_MS 15000
 
-// ┌─────────────────────────────────────────────────────────┐
-// │  SLEEP TIME: Change this to 29 for production           │
-// └─────────────────────────────────────────────────────────┘
-#define SLEEP_MINUTES 1
+#define SLEEP_SEVERE 1
+#define SLEEP_MILD 5
+#define SLEEP_CLEAR 29
 
-// ─── BLE UUIDs ───────────────────────────────────────────────
-#define SERVICE_UUID              "e3a1f0b0-1234-5678-abcd-000000000001"
-#define CHAR_CURRENT_UUID         "e3a1f0b0-1234-5678-abcd-000000000002"
-#define CHAR_PREDICTED_UUID       "e3a1f0b0-1234-5678-abcd-000000000003"
-#define CHAR_WEATHER_STATUS_UUID  "e3a1f0b0-1234-5678-abcd-000000000004"
-#define CHAR_ALERT_UUID           "e3a1f0b0-1234-5678-abcd-000000000005"
+#define SERVICE_UUID             "e3a1f0b0-1234-5678-abcd-000000000001"
+#define CHAR_CURRENT_UUID        "e3a1f0b0-1234-5678-abcd-000000000002"
+#define CHAR_PREDICTED_UUID      "e3a1f0b0-1234-5678-abcd-000000000003"
+#define CHAR_WEATHER_STATUS_UUID "e3a1f0b0-1234-5678-abcd-000000000004"
+#define CHAR_ALERT_UUID          "e3a1f0b0-1234-5678-abcd-000000000005"
+#define CHAR_TREND_UUID          "e3a1f0b0-1234-5678-abcd-000000000006"
+#define CHAR_HISTORY_UUID        "e3a1f0b0-1234-5678-abcd-000000000007"
 
-// ─── ESP-NOW Peer ────────────────────────────────────────────
-// Set to the OTHER ESP32's MAC address.
-// Use FF:FF:FF:FF:FF:FF to broadcast to ALL nearby ESP32s.
-// Find your MAC in Serial Monitor at boot.
-uint8_t peerAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+#define HISTORY_SLOTS 32
+#define NVS_NAMESPACE "wmind"
 
-// ─── ESP-NOW Message Structure ───────────────────────────────
-#define MSG_TYPE_WEATHER 1
-#define MSG_TYPE_TEXT    2
+struct TelemetryRecord {
+    float curTemp, curHum, curPres, curLux;
+    float predTemp, predHum, predPres, predLux;
+    float pressureTrend;
+    int weatherSev;
+    char weatherName[20];
+    uint32_t wakeNum;
+};
 
-typedef struct {
-    uint8_t  msgType;          // 1 = weather, 2 = text
-    char     senderName[16];   // device name
-    char     weatherName[20];  // classification
-    int      severity;         // 0-3
-    float    temperature;      // predicted temp
-    float    humidity;         // predicted humidity
-    float    pressure;         // predicted pressure
-    float    lux;              // predicted lux
-    char     textMsg[64];      // custom text message
-} EspNowMessage;
+struct KalmanFilter {
+    float Q;
+    float R;
+    float x;
+    float P;
+    bool init;
 
-EspNowMessage outgoingMsg;
-EspNowMessage incomingMsg;
-volatile bool newMessageReceived = false;
+    void reset(float q, float r) {
+        Q = q; R = r; x = 0.0f; P = 1.0f; init = false;
+    }
 
-// ─── Sensor objects ──────────────────────────────────────────
+    float update(float z) {
+        if (!init) { x = z; P = 1.0f; init = true; return x; }
+        P = P + Q;
+        float K = P / (P + R);
+        x = x + K * (z - x);
+        P = (1.0f - K) * P;
+        return x;
+    }
+};
+
+struct PressureTrend {
+    static constexpr int WINDOW = 8;
+    float samples[WINDOW];
+    int count = 0;
+    int head = 0;
+
+    void push(float p) {
+        samples[head % WINDOW] = p;
+        head++;
+        if (count < WINDOW) count++;
+    }
+
+    float slopePerMin() const {
+        if (count < 2) return 0.0f;
+        int n = count;
+        float sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        for (int i = 0; i < n; i++) {
+            float x = (float)i;
+            float y = samples[(head - n + i + WINDOW * 100) % WINDOW];
+            sumX += x; sumY += y;
+            sumXY += x * y; sumX2 += x * x;
+        }
+        float denom = n * sumX2 - sumX * sumX;
+        if (fabsf(denom) < 1e-6f) return 0.0f;
+        float slope = (n * sumXY - sumX * sumY) / denom;
+        return slope * (60.0f / (SAMPLE_INTERVAL_MS / 1000.0f));
+    }
+
+    const char* label() const {
+        float s = slopePerMin();
+        if (s > 1.5f) return "RISING FAST";
+        if (s > 0.4f) return "RISING";
+        if (s < -1.5f) return "FALLING FAST";
+        if (s < -0.4f) return "FALLING";
+        return "STEADY";
+    }
+};
+
+struct WeatherResult {
+    const char* name;
+    const char* detail;
+    int severity;
+    const char* icon;
+};
+
 DHT dht(DHT_PIN, DHT11);
 Adafruit_BMP085 bmp;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Preferences prefs;
 
-// ─── BLE objects ─────────────────────────────────────────────
-BLEServer*         pServer        = nullptr;
-BLECharacteristic* pCurrentChar   = nullptr;
-BLECharacteristic* pPredictedChar = nullptr;
-BLECharacteristic* pStatusChar    = nullptr;
-BLECharacteristic* pAlertChar     = nullptr;
-bool deviceConnected    = false;
-bool oldDeviceConnected = false;
+KalmanFilter kf[4];
+PressureTrend pressTrend;
 
-// ─── NN buffers ──────────────────────────────────────────────
-float sensorBuffer[NN_LOOKBACK][4];
+RTC_DATA_ATTR int wakeCount = 0;
+RTC_DATA_ATTR char prevWeatherName[20] = "UNKNOWN";
+RTC_DATA_ATTR int prevSeverity = -1;
+RTC_DATA_ATTR float prevPressureMb = 0.0f;
+RTC_DATA_ATTR uint8_t historyHead = 0;
+
+float sensorBuffer[NN_LOOKBACK][NN_FEATURES];
 float inputVec[NN_INPUT_DIM];
 float hidden1Buf[NN_HIDDEN1];
 float hidden2Buf[NN_HIDDEN2];
 float outputBuf[NN_OUTPUT_DIM];
 
-// ─── State ───────────────────────────────────────────────────
-float curTemp = 0, curHum = 0, curPres = 0, curLux = 0;
-float predTemp = 0, predHum = 0, predPres = 0, predLux = 0;
-const char* weatherName   = "WAITING";
-const char* weatherDetail = "First reading pending";
-int         weatherSev    = 0;
-bool        hasPrediction = false;
-int         cycleCount    = 0;
-String      prevAlertType = "UNKNOWN";
+float curTemp, curHum, curPres, curLux;
+float predTemp = 0.0f, predHum = 0.0f, predPres = 0.0f, predLux = 0.0f;
+float pressureSlopePaMin = 0.0f;
 
-// ═══════════════════════════════════════════════════════════════
-//  Weather Classification
-// ═══════════════════════════════════════════════════════════════
-struct WeatherResult {
-    const char* name;
-    const char* detail;
-    int         severity;
-};
+const char* weatherName = "UNKNOWN";
+const char* weatherDetail = "";
+const char* weatherIcon = "?";
+int weatherSev = 0;
+bool alertEscalated = false;
 
-WeatherResult classifyWeather(float tempC, float humPct, float pressPa, float lux) {
-    float pressMb = pressPa / 100.0;
-
-    if (tempC > 26.7 && pressMb < 980.0 && humPct >= 90.0 && lux < 50.0)
-        return {"HURRICANE", "Extreme low pressure + warm + humid", 3};
-
-    if (tempC < -7.0 && pressMb < 995.0 && humPct > 80.0 && lux < 100.0)
-        return {"BLIZZARD", "Extreme cold + low pressure", 3};
-
-    if (tempC > 18.0 && pressMb < 1000.0 && humPct > 70.0 && lux >= 100.0 && lux <= 1000.0)
-        return {"THUNDERSTORM", "Low pressure + warm + humid", 3};
-
-    if (tempC < 0.0 && pressMb < 1010.0 && humPct > 70.0 && lux >= 1000.0 && lux <= 5000.0)
-        return {"SNOW", "Below freezing + humid", 2};
-
-    if (tempC >= 4.4 && tempC <= 26.7 && pressMb >= 990.0 && pressMb <= 1005.0 &&
-        humPct >= 60.0 && lux >= 500.0 && lux <= 2000.0)
-        return {"RAIN", "Low pressure + humid + overcast", 2};
-
-    if (humPct >= 95.0 && pressMb > 1013.0 && lux < 100.0)
-        return {"FOG", "Saturated humidity + low visibility", 1};
-
-    if (tempC > 38.0 && humPct < 40.0 && lux > 500.0)
-        return {"HEAT WAVE", "Extreme heat + dry + bright", 2};
-
-    return {"CLEAR", "No severe weather detected", 0};
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  ESP-NOW Callbacks
-// ═══════════════════════════════════════════════════════════════
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    Serial.printf("ESP-NOW send: %s\n",
-                  status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
-}
-
-void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
-    if (len > sizeof(incomingMsg)) len = sizeof(incomingMsg);
-    memcpy(&incomingMsg, data, len);
-    newMessageReceived = true;
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  ESP-NOW Send Functions
-// ═══════════════════════════════════════════════════════════════
-void sendWeatherESPNow() {
-    memset(&outgoingMsg, 0, sizeof(outgoingMsg));
-    outgoingMsg.msgType = MSG_TYPE_WEATHER;
-    strncpy(outgoingMsg.senderName, DEVICE_NAME, 15);
-    strncpy(outgoingMsg.weatherName, weatherName, 19);
-    outgoingMsg.severity    = weatherSev;
-    outgoingMsg.temperature = predTemp;
-    outgoingMsg.humidity    = predHum;
-    outgoingMsg.pressure    = predPres;
-    outgoingMsg.lux         = predLux;
-
-    esp_now_send(peerAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
-}
-
-void sendTextESPNow(const char* message) {
-    memset(&outgoingMsg, 0, sizeof(outgoingMsg));
-    outgoingMsg.msgType = MSG_TYPE_TEXT;
-    strncpy(outgoingMsg.senderName, DEVICE_NAME, 15);
-    strncpy(outgoingMsg.textMsg, message, 63);
-
-    esp_now_send(peerAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  BLE Callbacks
-// ═══════════════════════════════════════════════════════════════
-class ServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* s) override {
-        deviceConnected = true;
-        Serial.println("BLE: Device connected");
-    }
-    void onDisconnect(BLEServer* s) override {
-        deviceConnected = false;
-        Serial.println("BLE: Device disconnected");
-    }
-};
-
-// ═══════════════════════════════════════════════════════════════
-//  NN Math
-// ═══════════════════════════════════════════════════════════════
 static inline float pgm_float(const float* addr) {
     float v; memcpy_P(&v, addr, sizeof(float)); return v;
 }
-static inline float relu(float x)     { return x > 0.0f ? x : 0.0f; }
+static inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 void denseForward(const float* in, int inN, float* out, int outN,
                   const float* W, const float* B, char act) {
     for (int j = 0; j < outN; j++) {
         float sum = pgm_float(&B[j]);
-        for (int i = 0; i < inN; i++)
+        for (int i = 0; i < inN; i++) {
             sum += in[i] * pgm_float(&W[i * outN + j]);
-        if (act == 'r')      sum = relu(sum);
-        else if (act == 's') sum = sigmoidf(sum);
+        }
+        switch (act) {
+            case 'r': sum = relu(sum); break;
+            case 's': sum = sigmoidf(sum); break;
+            default: break;
+        }
         out[j] = sum;
     }
 }
 
 void nnPredict(float* in, float* out) {
-    denseForward(in,         NN_INPUT_DIM, hidden1Buf, NN_HIDDEN1, W_HIDDEN1, B_HIDDEN1, 'r');
-    denseForward(hidden1Buf, NN_HIDDEN1,   hidden2Buf, NN_HIDDEN2, W_HIDDEN2, B_HIDDEN2, 'r');
-    denseForward(hidden2Buf, NN_HIDDEN2,   out,        NN_OUTPUT_DIM, W_OUTPUT, B_OUTPUT, 's');
+    denseForward(in, NN_INPUT_DIM, hidden1Buf, NN_HIDDEN1, W_HIDDEN1, B_HIDDEN1, 'r');
+    denseForward(hidden1Buf, NN_HIDDEN1, hidden2Buf, NN_HIDDEN2, W_HIDDEN2, B_HIDDEN2, 'r');
+    denseForward(hidden2Buf, NN_HIDDEN2, out, NN_OUTPUT_DIM, W_OUTPUT, B_OUTPUT, 's');
 }
 
 float normalizeVal(float raw, int i) {
@@ -253,376 +184,483 @@ float denormalizeVal(float n, int i) {
     return n * pgm_float(&FEAT_RANGE[i]) + pgm_float(&FEAT_MIN[i]);
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Read Sensors
-// ═══════════════════════════════════════════════════════════════
+float iqrMean(float* vals, int n) {
+    float sorted[NUM_SAMPLES];
+    memcpy(sorted, vals, n * sizeof(float));
+    for (int i = 0; i < n - 1; i++)
+        for (int j = i + 1; j < n; j++)
+            if (sorted[j] < sorted[i]) { float tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp; }
+
+    float q1 = sorted[n / 4];
+    float q3 = sorted[(3 * n) / 4];
+    float iqr = q3 - q1;
+    float lo = q1 - 1.5f * iqr;
+    float hi = q3 + 1.5f * iqr;
+
+    float sum = 0.0f; int cnt = 0;
+    for (int i = 0; i < n; i++)
+        if (vals[i] >= lo && vals[i] <= hi) { sum += vals[i]; cnt++; }
+    return cnt > 0 ? sum / cnt : 0.0f;
+}
+
+void applyPressureCorrection(float& predPres, float slopePaMin) {
+    predPres += slopePaMin * 30.0f;
+}
+
+WeatherResult classifyWeather(float tempC, float humPct,
+                              float pressPa, float lux,
+                              float slopePaMin) {
+    float pressMb = pressPa / 100.0f;
+    bool rapidDrop = slopePaMin < -2.0f;
+
+    if (tempC > 26.7f && pressMb < 980.0f && humPct >= 90.0f && lux < 50.0f)
+        return {"HURRICANE", "Extreme low pressure, warm & humid", 3, "HUR"};
+    if (tempC < -7.0f && pressMb < 995.0f && humPct > 80.0f && lux < 100.0f)
+        return {"BLIZZARD", "Extreme cold + low pressure", 3, "BLZ"};
+    if ((rapidDrop || pressMb < 1000.0f) && tempC > 18.0f && humPct > 70.0f)
+        return {"THUNDERSTORM", "Low pressure, warm & humid — storm approach", 3, "THN"};
+
+    if (tempC < 0.0f && pressMb < 1010.0f && humPct > 70.0f)
+        return {"SNOW", "Sub-zero + humid + low pressure", 2, "SNW"};
+    if (tempC >= 4.4f && tempC <= 26.7f && pressMb >= 990.0f && pressMb <= 1005.0f
+        && humPct >= 60.0f && lux >= 500.0f && lux <= 2000.0f)
+        return {"RAIN", "Low pressure, humid & overcast", 2, "RAN"};
+    if (tempC > 38.0f && humPct < 40.0f && lux > 500.0f)
+        return {"HEAT WAVE", "Extreme heat, dry & bright", 2, "HT!"};
+    if (rapidDrop && pressMb < 1010.0f && lux < 100.0f)
+        return {"STORM WATCH", "Rapid pressure drop detected", 2, "WRN"};
+
+    if (humPct >= 95.0f && pressMb > 1013.0f && lux < 100.0f)
+        return {"FOG", "Saturated humidity, low visibility", 1, "FOG"};
+    if (pressMb < 1010.0f && humPct > 60.0f)
+        return {"OVERCAST", "Low pressure, elevated humidity", 1, "OVC"};
+    if (humPct >= 70.0f && humPct < 95.0f && pressMb >= 1008.0f)
+        return {"CLOUDY", "Partly cloudy conditions", 1, "CLD"};
+
+    return {"CLEAR", "No severe weather indicators", 0, "CLR"};
+}
+
+// bool readSensors(float* temp, float* hum, float* pres, float* lux) {
+//     float t = dht.readTemperature();
+//     float h = dht.readHumidity();
+//     if (isnan(t) || isnan(h)) return false;
+//     if (t < -40.0f || t > 80.0f || h < 0.0f || h > 100.0f) return false;
+//     *temp = kf[0].update(t);
+//     *hum = kf[1].update(h);
+//     *pres = kf[2].update((float)bmp.readSealevelPressure(515));
+//     *lux = kf[3].update((float)analogRead(LIGHT_PIN));
+//     return true;
+// }
 bool readSensors(float* temp, float* hum, float* pres, float* lux) {
-    *temp = dht.readTemperature();
-    *hum  = dht.readHumidity();
-    if (isnan(*temp) || isnan(*hum)) return false;
-    *pres = bmp.readSealevelPressure(515);
-    *lux  = (float)analogRead(LIGHT_PIN);
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (isnan(t) || isnan(h)) return false;
+    if (t < -40.0f || t > 80.0f || h < 0.0f || h > 100.0f) return false;
+    *temp = kf[0].update(t);
+    *hum  = kf[1].update(h);
+    *pres = kf[2].update((float)bmp.readSealevelPressure(515));
+    float rawADC = (float)analogRead(LIGHT_PIN);
+    *lux  = kf[3].update(rawADC * (632.0f / 4095.0f));
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Update OLED
-// ═══════════════════════════════════════════════════════════════
-void updateOLED() {
+void drawProgressBar(int x, int y, int w, int h, int pct) {
+    display.drawRect(x, y, w, h, SSD1306_WHITE);
+    int fill = (w - 2) * pct / 100;
+    if (fill > 0) display.fillRect(x + 1, y + 1, fill, h - 2, SSD1306_WHITE);
+}
+
+void renderCollectingScreen(int sample, int total, float t, float h, float p, float l) {
     display.clearDisplay();
+    display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
-    display.setTextSize(1);
+    // --- Header ---
+    // Clean top bar without the full-width inverse block for a lighter look
     display.setCursor(0, 0);
-    display.print("NOW");
+    display.print("WeatherMind");
+    display.setCursor(80, 0);
+    display.print("SAMPLING"); 
 
-    display.setCursor(0, 10);
-    display.print("T:");
-    display.print(curTemp, 1);
-    display.print("C  H:");
-    display.print(curHum, 0);
-    display.print("%");
+    // --- Progress Bar ---
+    int pct = sample * 100 / total;
+    drawProgressBar(0, 11, 128, 6, pct); // Slightly thinner bar
+    // Removed the text inside the bar for a cleaner visual flow
 
-    display.setCursor(0, 20);
-    display.print("P:");
-    display.print(curPres, 0);
-    display.print(" L:");
-    display.print((int)curLux);
+    // --- Live Sensor Data (Two-Column Layout) ---
+    // Row 1: Temp and Humidity
+    display.setCursor(0, 24);
+    display.printf("T:%.1fC", t);
+    display.setCursor(66, 24);
+    display.printf("H:%.0f%%", h);
 
-    display.drawLine(0, 30, 127, 30, SSD1306_WHITE);
-
-    display.setTextSize(1);
+    // Row 2: Pressure and Light
     display.setCursor(0, 34);
-    display.print("30m: ");
-    display.print(predTemp, 1);
-    display.print("C");
+    display.printf("P:%.0fPa", p);
+    display.setCursor(66, 34);
+    display.printf("L:%.0f", l);
 
-    display.setTextSize(2);
-    display.setCursor(0, 46);
+    // --- Status Area ---
+    display.drawLine(0, 50, 127, 50, SSD1306_WHITE); // Divider
+    
+    display.setCursor(0, 55);
+    display.printf("Progress: %d/%d", sample, total);
+
+    display.display();
+}
+
+void drawDangerTriangle(int x, int y) {
+    display.drawLine(x + 5, y,     x,      y + 9, SSD1306_WHITE);
+    display.drawLine(x + 5, y,     x + 10, y + 9, SSD1306_WHITE);
+    display.drawLine(x,     y + 9, x + 10, y + 9, SSD1306_WHITE);
+    display.drawLine(x + 5, y + 3, x + 5, y + 6, SSD1306_WHITE);
+    display.drawPixel(x + 5, y + 8, SSD1306_WHITE);
+}
+
+void renderResultScreen() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Current T + H on one row
+    display.setCursor(0, 0);
+    display.printf("T:%.1fC", curTemp);
+    display.setCursor(66, 0);
+    display.printf("H:%.0f%%", curHum);
+
+    // Current P
+    display.setCursor(0, 10);
+    display.printf("P:%.0fPa", curPres);
+
+    // Divider with "30 min" label
+    display.drawLine(0, 23, 127, 23, SSD1306_WHITE);
+    display.fillRect(40, 20, 48, 7, SSD1306_BLACK);
+    display.setCursor(43, 20);
+    display.print("30 min");
+
+    // Predicted T + H
+    display.setCursor(0, 30);
+    display.printf("T:%.1fC", predTemp);
+    display.setCursor(66, 30);
+    display.printf("H:%.0f%%", predHum);
+
+    // Predicted P
+    display.setCursor(0, 40);
+    display.printf("P:%.0fPa", predPres);
+
+    // Status line with danger triangle if not clear
+    display.setCursor(0, 54);
+    display.print(">> ");
     display.print(weatherName);
 
-    display.display();
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  Show incoming ESP-NOW message on OLED
-// ═══════════════════════════════════════════════════════════════
-void showIncomingMessage() {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-
-    if (incomingMsg.msgType == MSG_TYPE_WEATHER) {
-        display.println("== INCOMING ==");
-        display.printf("From: %s\n", incomingMsg.senderName);
-        display.println();
-        display.setTextSize(2);
-        display.println(incomingMsg.weatherName);
-        display.setTextSize(1);
-        display.printf("Sev:%d T:%.1fC\n", incomingMsg.severity, incomingMsg.temperature);
-    } else {
-        display.println("== MESSAGE ==");
-        display.printf("From: %s\n", incomingMsg.senderName);
-        display.println();
-        display.println(incomingMsg.textMsg);
+    if (weatherSev > 0) {
+        drawDangerTriangle(115, 54);
     }
 
     display.display();
-    delay(5000);
-    updateOLED();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Update BLE
-// ═══════════════════════════════════════════════════════════════
-void updateBLE() {
-    char buf[80];
+void saveToFlash(const TelemetryRecord& rec) {
+    prefs.begin(NVS_NAMESPACE, false);
+    char key[12];
+    snprintf(key, sizeof(key), "rec%02u", (unsigned)(historyHead % HISTORY_SLOTS));
+    prefs.putBytes(key, &rec, sizeof(TelemetryRecord));
+    historyHead++;
+    prefs.putUInt("head", historyHead);
+    prefs.end();
+}
 
-    snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.0f", curTemp, curHum, curPres, curLux);
-    pCurrentChar->setValue(buf);
-    if (deviceConnected) pCurrentChar->notify();
-
-    if (!hasPrediction) return;
-
-    snprintf(buf, sizeof(buf), "%.1f,%.1f,%.0f,%.1f", predTemp, predHum, predPres, predLux);
-    pPredictedChar->setValue(buf);
-    if (deviceConnected) pPredictedChar->notify();
-
-    char statusBuf[120];
-    snprintf(statusBuf, sizeof(statusBuf), "%s|%d|%s", weatherName, weatherSev, weatherDetail);
-    pStatusChar->setValue(statusBuf);
-    if (deviceConnected) pStatusChar->notify();
-
-    if (String(weatherName) != prevAlertType) {
-        char alertBuf[120];
-        if (weatherSev >= 2)
-            snprintf(alertBuf, sizeof(alertBuf), "ALERT:%s|%s", weatherName, weatherDetail);
-        else
-            snprintf(alertBuf, sizeof(alertBuf), "OK:%s|%s", weatherName, weatherDetail);
-        pAlertChar->setValue(alertBuf);
-        if (deviceConnected) pAlertChar->notify();
-        Serial.printf(">>> BLE ALERT: %s\n", alertBuf);
-        prevAlertType = String(weatherName);
+int readHistory(TelemetryRecord* buf, int maxN) {
+    prefs.begin(NVS_NAMESPACE, true);
+    uint32_t head = prefs.getUInt("head", 0);
+    int cnt = min((int)head, min(maxN, HISTORY_SLOTS));
+    for (int i = 0; i < cnt; i++) {
+        char key[12];
+        uint32_t slot = (head - cnt + i) % HISTORY_SLOTS;
+        snprintf(key, sizeof(key), "rec%02u", (unsigned)slot);
+        prefs.getBytes(key, &buf[i], sizeof(TelemetryRecord));
     }
+    prefs.end();
+    return cnt;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Run Full Cycle: collect -> predict -> display -> broadcast
-// ═══════════════════════════════════════════════════════════════
-void runCycle() {
-    cycleCount++;
-    Serial.printf("\n=========================================\n");
-    Serial.printf("  WeatherMind - cycle #%d\n", cycleCount);
-    Serial.printf("=========================================\n");
+void runBLE() {
+    Serial.println("[BLE] Starting GATT server...");
+    BLEDevice::init("WeatherMind-Pro");
+    BLEServer* server = BLEDevice::createServer();
+    BLEService* service = server->createService(SERVICE_UUID);
 
-    // ── Power on sensors ─────────────────────────────────────
+    auto addChar = [&](const char* uuid, const char* value) -> BLECharacteristic* {
+        BLECharacteristic* ch = service->createCharacteristic(
+            uuid, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+        ch->addDescriptor(new BLE2902());
+        ch->setValue(value);
+        return ch;
+    };
+
+    char curStr[64];
+    snprintf(curStr, sizeof(curStr), "T:%.1f H:%.0f P:%.1f L:%.0f",
+             curTemp, curHum, curPres / 100.0f, curLux);
+    addChar(CHAR_CURRENT_UUID, curStr);
+
+    char predStr[64];
+    snprintf(predStr, sizeof(predStr), "T:%.1f H:%.0f P:%.1f L:%.0f",
+             predTemp, predHum, predPres / 100.0f, curLux);
+    addChar(CHAR_PREDICTED_UUID, predStr);
+
+    char wStr[96];
+    snprintf(wStr, sizeof(wStr), "%s|%d|%s", weatherName, weatherSev, weatherDetail);
+    addChar(CHAR_WEATHER_STATUS_UUID, wStr);
+
+    char alertStr[4];
+    snprintf(alertStr, sizeof(alertStr), "%d", alertEscalated ? 1 : 0);
+    addChar(CHAR_ALERT_UUID, alertStr);
+
+    char trendStr[32];
+    snprintf(trendStr, sizeof(trendStr), "%s|%.2f", pressTrend.label(), pressureSlopePaMin);
+    addChar(CHAR_TREND_UUID, trendStr);
+
+    TelemetryRecord hist[8];
+    int hcnt = readHistory(hist, 8);
+    String histStr = "";
+    for (int i = 0; i < hcnt; i++) {
+        char line[64];
+        snprintf(line, sizeof(line), "%.1f,%.0f,%.1f,%s;",
+                 hist[i].curTemp, hist[i].curHum,
+                 hist[i].curPres / 100.0f, hist[i].weatherName);
+        histStr += line;
+    }
+    BLECharacteristic* histCh = service->createCharacteristic(
+        CHAR_HISTORY_UUID, BLECharacteristic::PROPERTY_READ);
+    histCh->setValue(histStr.c_str());
+
+    service->start();
+
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    BLEDevice::startAdvertising();
+
+    Serial.printf("[BLE] Advertising for %d ms...\n", BLE_WINDOW_MS);
+    delay(BLE_WINDOW_MS);
+
+    BLEDevice::stopAdvertising();
+    BLEDevice::deinit(true);
+    Serial.println("[BLE] Done.");
+}
+
+void logSection(const char* title) {
+    Serial.printf("\n┌─────────────────────────────────────────\n│ %s\n└─────────────────────────────────────────\n", title);
+}
+
+void setup() {
+    Serial.begin(115200);
+    wakeCount++;
+
+    logSection("WeatherMind Pro — Wake");
+    Serial.printf("  Wake #%d\n", wakeCount);
+
+    kf[0].reset(0.01f, 0.5f);
+    kf[1].reset(0.01f, 1.0f);
+    kf[2].reset(0.5f, 5.0f);
+    kf[3].reset(5.0f, 20.0f);
+
+    pinMode(SENSOR_POWER_PIN, OUTPUT);
     digitalWrite(SENSOR_POWER_PIN, HIGH);
     delay(3000);
 
-    // ── Re-init sensors ──────────────────────────────────────
     Wire.begin(21, 22);
     dht.begin();
+    analogReadResolution(12);
+    pinMode(LIGHT_PIN, INPUT);
 
     if (!bmp.begin()) {
-        Serial.println("BMP180 not found!");
-        return;
+        Serial.println("[ERROR] BMP180 not found — halting");
+        if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+            while (true) delay(1000);
+        }
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 20);
+        display.println("BMP180 ERROR");
+        display.display();
+        while (true) delay(1000);
     }
 
-    // ── Show collecting ──────────────────────────────────────
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("Collecting data...");
-    display.println("12 readings / 1 min");
-    display.display();
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println("[ERROR] OLED not found — halting");
+        while (true) delay(1000);
+    }
 
-    // ── Flush DHT11 ──────────────────────────────────────────
+    display.clearDisplay();
+    display.display();
+    delay(200);
+
+    display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setTextSize(1);
+    display.setCursor(32, 2); // Centered roughly
+    display.print("WEATHERMIND"); // Corrected typo from 'Weatherind'
+
+    // --- Main Content ---
+    display.setTextColor(SSD1306_WHITE);
+    
+    // Subtitle - slightly lower and centered
+    display.setCursor(10, 28); 
+    display.print("by Shadow Mechanics");
+    
+    // Aesthetic Divider (matches your result screen style)
+    display.drawLine(20, 39, 108, 39, SSD1306_WHITE);
+
+    // Wake Counter - smaller/subtle at the bottom
+    display.setCursor(42, 45);
+    display.printf("Session #%d", wakeCount);
+
+    display.display();
+    delay(2500);
+
     dht.readTemperature();
     dht.readHumidity();
     delay(2500);
 
-    // ── Collect 12 readings ──────────────────────────────────
-    int samplesCollected = 0;
+    logSection("Data Collection");
+
+    float rawT[NUM_SAMPLES], rawH[NUM_SAMPLES], rawP[NUM_SAMPLES], rawL[NUM_SAMPLES];
+    int samplesOk = 0;
 
     for (int s = 0; s < NUM_SAMPLES; s++) {
         float t, h, p, l;
+        bool ok = readSensors(&t, &h, &p, &l);
 
-        if (readSensors(&t, &h, &p, &l)) {
+        if (ok) {
             sensorBuffer[s][0] = normalizeVal(t, 0);
             sensorBuffer[s][1] = normalizeVal(h, 1);
             sensorBuffer[s][2] = normalizeVal(p, 2);
             sensorBuffer[s][3] = normalizeVal(l, 3);
 
+            rawT[s] = t; rawH[s] = h; rawP[s] = p; rawL[s] = l;
+            pressTrend.push(p);
             curTemp = t; curHum = h; curPres = p; curLux = l;
-            samplesCollected++;
-
-            Serial.printf("  [%2d/%d] T:%.1fC  H:%.1f%%  P:%.0fPa  L:%.0f\n",
+            samplesOk++;
+            Serial.printf("  [%2d/%d] T:%5.1fC H:%4.1f%% P:%7.0fPa L:%5.0f  [KF]\n",
                           s + 1, NUM_SAMPLES, t, h, p, l);
         } else {
-            Serial.printf("  [%2d/%d] DHT failed, copying previous\n", s + 1, NUM_SAMPLES);
-            if (s > 0)
-                for (int f = 0; f < 4; f++)
+            if (s > 0) {
+                for (int f = 0; f < NN_FEATURES; f++)
                     sensorBuffer[s][f] = sensorBuffer[s - 1][f];
+                rawT[s] = curTemp; rawH[s] = curHum;
+                rawP[s] = curPres; rawL[s] = curLux;
+            }
+            Serial.printf("  [%2d/%d] DHT read failed — using KF estimate\n", s + 1, NUM_SAMPLES);
         }
 
-        // Progress on OLED
-        display.clearDisplay();
-        display.setCursor(0, 0);
-        display.printf("Collecting %d/%d\n", s + 1, NUM_SAMPLES);
-        if (samplesCollected > 0) {
-            display.printf("T:%.1fC H:%.1f%%\n", curTemp, curHum);
-            display.printf("P:%.0fPa L:%.0f\n", curPres, curLux);
-        }
-        display.display();
+        renderCollectingScreen(s + 1, NUM_SAMPLES, curTemp, curHum, curPres, curLux);
 
-        // Check for incoming ESP-NOW during collection
-        if (newMessageReceived) {
-            newMessageReceived = false;
-            Serial.printf("ESP-NOW received from %s during collection\n",
-                          incomingMsg.senderName);
-        }
-
-        if (s < NUM_SAMPLES - 1)
-            delay(SAMPLE_INTERVAL_MS);
+        if (s < NUM_SAMPLES - 1) delay(SAMPLE_INTERVAL_MS);
     }
 
-    // ── NN inference ─────────────────────────────────────────
-    if (samplesCollected >= NUM_SAMPLES / 2) {
-        for (int s = 0; s < NN_LOOKBACK; s++)
-            for (int f = 0; f < 4; f++)
-                inputVec[s * 4 + f] = sensorBuffer[s][f];
+    Serial.printf("  Collected %d/%d valid samples\n", samplesOk, NUM_SAMPLES);
+
+    if (samplesOk > 2) {
+        curTemp = iqrMean(rawT, samplesOk);
+        curHum = iqrMean(rawH, samplesOk);
+        curPres = iqrMean(rawP, samplesOk);
+        curLux = iqrMean(rawL, samplesOk);
+    }
+
+    pressureSlopePaMin = pressTrend.slopePerMin();
+    Serial.printf("  Pressure trend: %.2f Pa/min  [%s]\n",
+                  pressureSlopePaMin, pressTrend.label());
+
+    logSection("Neural Network Inference");
+
+    if (samplesOk >= NUM_SAMPLES / 2) {
+        for (int s = 0; s < NN_LOOKBACK; s++) {
+            for (int f = 0; f < NN_FEATURES; f++) {
+                inputVec[s * NN_FEATURES + f] = sensorBuffer[s][f];
+            }
+        }
 
         nnPredict(inputVec, outputBuf);
+
+        Serial.printf("Raw Norm Temp: %.6f\n", outputBuf[0]);
+        Serial.printf("Raw Norm Hum:  %.6f\n", outputBuf[1]);
+        Serial.printf("Raw Norm Pres: %.6f\n", outputBuf[2]);
 
         predTemp = denormalizeVal(outputBuf[0], 0);
         predHum  = denormalizeVal(outputBuf[1], 1);
         predPres = denormalizeVal(outputBuf[2], 2);
-        predLux  = denormalizeVal(outputBuf[3], 3);
+        predLux = curLux;
 
-        WeatherResult w = classifyWeather(predTemp, predHum, predPres, predLux);
-        weatherName   = w.name;
+        applyPressureCorrection(predPres, pressureSlopePaMin);
+
+        predTemp = constrain(predTemp, -50.0f, 80.0f);
+        predHum = constrain(predHum, 0.0f, 100.0f);
+        predPres = constrain(predPres, 85000.0f, 108000.0f);
+        predLux = constrain(predLux, 0.0f, 632.0f);
+
+        WeatherResult w = classifyWeather(predTemp, predHum, predPres, curLux, pressureSlopePaMin);
+        weatherName = w.name;
         weatherDetail = w.detail;
-        weatherSev    = w.severity;
-        hasPrediction = true;
+        weatherSev = w.severity;
+        weatherIcon = w.icon;
 
-        const char* sevLabel[] = {"OK", "MILD", "MODERATE", "SEVERE"};
-        Serial.println("────────────────────────────────────────");
-        Serial.printf("  PRED -> T:%.1fC  H:%.1f%%  P:%.0fPa  L:%.1f\n",
+        alertEscalated = (weatherSev > prevSeverity && prevSeverity >= 0);
+        strncpy(prevWeatherName, weatherName, sizeof(prevWeatherName) - 1);
+        prevWeatherName[sizeof(prevWeatherName) - 1] = '\0';
+        prevSeverity = weatherSev;
+        prevPressureMb = curPres / 100.0f;
+
+        static const char* sevLabel[] = {"CLEAR", "MILD", "MODERATE", "SEVERE"};
+        Serial.printf("  Pred   T:%.1fC  H:%.1f%%  P:%.0fPa  L:%.1f\n",
                       predTemp, predHum, predPres, predLux);
-        Serial.printf("  WEATHER -> %s [%s]: %s\n",
-                      weatherName, sevLabel[weatherSev], weatherDetail);
-        Serial.println("────────────────────────────────────────");
+        Serial.printf("  Result %s  [%s]  Escalated:%s\n",
+                      weatherName, sevLabel[min(weatherSev,3)],
+                      alertEscalated ? "YES" : "no");
     } else {
         weatherName = "NO DATA";
-        weatherDetail = "Sensor errors";
+        weatherDetail = "Insufficient samples";
         weatherSev = 0;
+        Serial.println("  Skipped — too few valid samples");
     }
 
-    // ── Power off sensors ────────────────────────────────────
+    renderResultScreen();
+
+    TelemetryRecord rec;
+    rec.curTemp = curTemp;  rec.curHum = curHum;
+    rec.curPres = curPres;   rec.curLux = curLux;
+    rec.predTemp = predTemp; rec.predHum = predHum;
+    rec.predPres = predPres; rec.predLux = predLux;
+    rec.pressureTrend = pressureSlopePaMin;
+    rec.weatherSev = weatherSev;
+    rec.wakeNum = wakeCount;
+    strncpy(rec.weatherName, weatherName, sizeof(rec.weatherName) - 1);
+    rec.weatherName[sizeof(rec.weatherName) - 1] = '\0';
+    saveToFlash(rec);
+    Serial.printf("  Saved record #%u to NVS flash\n", wakeCount);
+
     digitalWrite(SENSOR_POWER_PIN, LOW);
 
-    // ── Update everything ────────────────────────────────────
-    updateOLED();
-    updateBLE();
+    logSection("BLE Broadcast");
+    runBLE();
 
-    // ── Broadcast to other ESP32s ────────────────────────────
-    if (hasPrediction) {
-        sendWeatherESPNow();
+    int sleepMin;
+    switch (weatherSev) {
+        case 3: sleepMin = SLEEP_SEVERE; break;
+        case 2: sleepMin = SLEEP_MILD; break;
+        default: sleepMin = SLEEP_CLEAR; break;
     }
+
+    logSection("Deep Sleep");
+    Serial.printf("  Weather severity: %d  ->  sleeping %d min\n", weatherSev, sleepMin);
+    Serial.printf("  OLED will retain last display during sleep.\n");
+    Serial.flush();
+
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepMin * 60ULL * 1000000ULL);
+    esp_deep_sleep_start();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  SETUP (runs once on boot)
-// ═══════════════════════════════════════════════════════════════
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-
-    pinMode(SENSOR_POWER_PIN, OUTPUT);
-    digitalWrite(SENSOR_POWER_PIN, LOW);
-    analogReadResolution(12);
-    pinMode(LIGHT_PIN, INPUT);
-
-    // ── Init OLED ────────────────────────────────────────────
-    Wire.begin(21, 22);
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("OLED not found!");
-        while (1) delay(10);
-    }
-
-    // ── Boot screen ──────────────────────────────────────────
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 15);
-    display.println("  WeatherMind");
-    display.setCursor(0, 30);
-    display.println(" by Shadow Mechanics");
-    display.display();
-    delay(3000);
-
-    // ── Init ESP-NOW ─────────────────────────────────────────
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("ESP-NOW init failed!");
-    } else {
-        esp_now_register_send_cb(onDataSent);
-        esp_now_register_recv_cb(onDataRecv);
-
-        esp_now_peer_info_t peerInfo = {};
-        memcpy(peerInfo.peer_addr, peerAddress, 6);
-        peerInfo.channel = 0;
-        peerInfo.encrypt = false;
-        esp_now_add_peer(&peerInfo);
-
-        Serial.println("ESP-NOW: Ready");
-        Serial.printf("ESP-NOW: Device name '%s'\n", DEVICE_NAME);
-    }
-
-    // Print MAC address for pairing
-    Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
-
-    // ── Init BLE (stays on forever) ──────────────────────────
-    BLEDevice::init("WeatherMind");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new ServerCallbacks());
-
-    BLEService* pService = pServer->createService(SERVICE_UUID);
-
-    pCurrentChar = pService->createCharacteristic(
-        CHAR_CURRENT_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pCurrentChar->addDescriptor(new BLE2902());
-
-    pPredictedChar = pService->createCharacteristic(
-        CHAR_PREDICTED_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pPredictedChar->addDescriptor(new BLE2902());
-
-    pStatusChar = pService->createCharacteristic(
-        CHAR_WEATHER_STATUS_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pStatusChar->addDescriptor(new BLE2902());
-
-    pAlertChar = pService->createCharacteristic(
-        CHAR_ALERT_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY);
-    pAlertChar->addDescriptor(new BLE2902());
-
-    pService->start();
-
-    BLEAdvertising* pAdv = BLEDevice::getAdvertising();
-    pAdv->addServiceUUID(SERVICE_UUID);
-    pAdv->setScanResponse(true);
-    pAdv->setMinPreferred(0x06);
-    BLEDevice::startAdvertising();
-
-    Serial.println("BLE: Always on, advertising as 'WeatherMind'");
-
-    // ── Run first cycle immediately ──────────────────────────
-    runCycle();
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  LOOP (light sleep between cycles, BLE stays alive)
-// ═══════════════════════════════════════════════════════════════
 void loop() {
-    // Handle BLE reconnection
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500);
-        BLEDevice::startAdvertising();
-        Serial.println("BLE: Restarted advertising");
-    }
-    oldDeviceConnected = deviceConnected;
-
-    // Handle incoming ESP-NOW messages
-    if (newMessageReceived) {
-        newMessageReceived = false;
-
-        if (incomingMsg.msgType == MSG_TYPE_WEATHER) {
-            Serial.printf("ESP-NOW from %s: %s [sev:%d] T:%.1fC\n",
-                          incomingMsg.senderName,
-                          incomingMsg.weatherName,
-                          incomingMsg.severity,
-                          incomingMsg.temperature);
-        } else {
-            Serial.printf("ESP-NOW msg from %s: %s\n",
-                          incomingMsg.senderName,
-                          incomingMsg.textMsg);
-        }
-
-        showIncomingMessage();
-    }
-
-    // Light sleep — BLE stays alive
-    Serial.printf("Light sleep %d min...\n", SLEEP_MINUTES);
-    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60ULL * 1000000ULL);
-    esp_light_sleep_start();
-
-    Serial.println("Woke from light sleep");
-    runCycle();
 }

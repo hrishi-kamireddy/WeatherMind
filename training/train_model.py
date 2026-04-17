@@ -1,13 +1,13 @@
-"""
-WeatherMind — Tiny NN Trainer for ESP32
-=======================================
-Trains a small NN on temperature, humidity, pressure, and lux
-to predict values ~30 minutes ahead. Exports weights as a C
-header for ESP32 deployment. Computes feature importance.
+# """
+# WeatherMind — Tiny NN Trainer for ESP32
+# =======================================
+# Trains a small NN on temperature, humidity, pressure, and lux
+# to predict values ~30 minutes ahead. Exports weights as a C
+# header for ESP32 deployment. Computes feature importance.
 
-pip install kagglehub pandas numpy scikit-learn tensorflow
-python train_model.py
-"""
+# pip install kagglehub pandas numpy scikit-learn tensorflow
+# python train_model.py
+# """
 
 import numpy as np
 import pandas as pd
@@ -33,6 +33,8 @@ df = pd.read_csv(os.path.join(dataset_path, "DATA-large.CSV"))
 print(f"Dataset shape: {df.shape}")
 print(f"Columns: {list(df.columns)}")
 print(df.head())
+print(df["lux"].describe())
+
 
 # ─── 2. Preprocess ───────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -75,8 +77,6 @@ feat_min = data.min(axis=0)
 feat_max = data.max(axis=0)
 # --- ADD THESE MANUALLY ---
 # Force Lux (index 3) to a realistic indoor range (0 to 4095 lux)
-feat_min[3] = 0.0
-feat_max[3] = 4095.0
 # --------------------------
 
 feat_range = feat_max - feat_min
@@ -102,7 +102,7 @@ for i in range(len(data_norm) - LOOKBACK - PREDICTION_STEP):
     window = data_norm[i : i + LOOKBACK]
     target = data_norm[i + LOOKBACK + PREDICTION_STEP - 1]
     X_list.append(window.flatten())
-    Y_list.append(target)
+    Y_list.append(target[:3])
 
 X = np.array(X_list, dtype=np.float32)
 Y = np.array(Y_list, dtype=np.float32)
@@ -126,7 +126,7 @@ from tensorflow import keras
 INPUT_DIM = LOOKBACK * 4  # 48
 HIDDEN1 = 16
 HIDDEN2 = 8
-OUTPUT_DIM = 4
+OUTPUT_DIM = 3
 
 model = keras.Sequential([
     keras.layers.Dense(HIDDEN1, activation="relu", input_shape=(INPUT_DIM,), name="hidden1"),
@@ -154,11 +154,11 @@ print(f"\nTest Loss (MSE): {loss:.6f}")
 print(f"Test MAE (normalized): {mae:.6f}")
 
 Y_pred = model.predict(X_test)
-abs_errors = np.abs(Y_pred - Y_test) * feat_range
+abs_errors = np.abs(Y_pred - Y_test) * feat_range[:3]
 mean_abs_errors = abs_errors.mean(axis=0)
 print(f"\nDenormalized MAE per feature:")
-for i, name in enumerate(FEATURES):
-    unit = ["C", "%", "Pa", "lux"][i]
+for i, name in enumerate(FEATURES[:3]):
+    unit = ["C", "%", "Pa"][i]
     print(f"  {name:>12s}: {mean_abs_errors[i]:.2f} {unit}")
 
 # ─── 7. Feature importance ───────────────────────────────────
@@ -167,7 +167,7 @@ print("Step 5: Computing feature importance...")
 print("=" * 60)
 
 baseline_mse = np.mean((Y_pred - Y_test) ** 2, axis=0)
-importance_matrix = np.zeros((4, 4))
+importance_matrix = np.zeros((4, 3))
 
 for input_feat_idx in range(4):
     cols = [t * 4 + input_feat_idx for t in range(LOOKBACK)]
@@ -179,9 +179,9 @@ for input_feat_idx in range(4):
     importance_matrix[input_feat_idx] = (shuffled_mse - baseline_mse) / (baseline_mse + 1e-10)
 
 print("\nFeature importance (input -> output):")
-print(f"{'':>12s}  {'Pred Temp':>10s}  {'Pred Hum':>10s}  {'Pred Press':>10s}  {'Pred Lux':>10s}")
+print(f"{'':>12s}  {'Pred Temp':>10s}  {'Pred Hum':>10s}  {'Pred Press':>10s}")
 for i, name in enumerate(FEATURES):
-    row = "  ".join(f"{importance_matrix[i, j]:10.4f}" for j in range(4))
+    row = "  ".join(f"{importance_matrix[i, j]:10.4f}" for j in range(3))
     print(f"{name:>12s}  {row}")
 
 imp_max = importance_matrix.max()
@@ -211,6 +211,29 @@ with open("feature_importance.json", "w") as f:
     json.dump(importance_data, f, indent=2)
 print("Saved: feature_importance.json")
 
+# ─── Accuracy metrics ─────────────────────────────────────────
+print("\n" + "=" * 60)
+print("Model Accuracy Summary")
+print("=" * 60)
+
+# R² score per feature
+from sklearn.metrics import r2_score
+for i, name in enumerate(FEATURES[:3]):
+    r2 = r2_score(Y_test[:, i], Y_pred[:, i])
+    print(f"  {name:>12s}  R²: {r2:.4f}  ({r2*100:.1f}% variance explained)")
+
+# Overall R²
+overall_r2 = r2_score(Y_test, Y_pred, multioutput='uniform_average')
+print(f"\n  {'Overall':>12s}  R²: {overall_r2:.4f}  ({overall_r2*100:.1f}%)")
+
+# MAPE (Mean Absolute Percentage Error)
+Y_test_denorm = Y_test * feat_range[:3] + feat_min[:3]
+Y_pred_denorm = Y_pred * feat_range[:3] + feat_min[:3]
+for i, name in enumerate(FEATURES[:3]):
+    mask = Y_test_denorm[:, i] != 0
+    mape = np.mean(np.abs((Y_test_denorm[mask, i] - Y_pred_denorm[mask, i]) / Y_test_denorm[mask, i])) * 100
+    print(f"  {name:>12s}  MAPE: {mape:.2f}%")
+
 # ─── 8. Export C header ──────────────────────────────────────
 print("\n" + "=" * 60)
 print("Step 6: Exporting C header for ESP32...")
@@ -230,7 +253,7 @@ def array_to_c(name, arr):
 
 header_lines = [
     "// AUTO-GENERATED - WeatherMind NN Weights",
-    "// Model: 48 -> 16 (ReLU) -> 8 (ReLU) -> 4 (Sigmoid)",
+    "// Model: 48 -> 16 (ReLU) -> 8 (ReLU) -> 3 (Sigmoid)",
     f"// Prediction horizon: ~{PREDICTION_STEP * 5 / 60:.0f} minutes",
     f"// Total parameters: {total_params}",
     "#pragma once",
