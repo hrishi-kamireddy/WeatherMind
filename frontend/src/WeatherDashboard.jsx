@@ -955,7 +955,17 @@ export default function WeatherMindDashboard() {
                           fontFamily: mono,
                         }}
                       >
-                        Trend: {trend.label}
+                        {delta !== null
+                          ? Math.abs(delta) > 2
+                            ? delta > 0
+                              ? "Rising FAST"
+                              : "Falling FAST"
+                            : Math.abs(delta) > 0.1
+                              ? delta > 0
+                                ? "Rising"
+                                : "Falling"
+                              : "Steady"
+                          : ""}
                       </span>
                     </div>
                   </div>
