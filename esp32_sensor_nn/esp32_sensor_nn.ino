@@ -473,6 +473,33 @@ void sendEspNow(const TelemetryRecord& data) {
     WiFi.mode(WIFI_OFF);
 }
 
+void renderTransmissionScreen(bool sent) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    display.setCursor(0, 0);
+    display.print("WeatherMind");
+
+    display.drawLine(0, 12, 127, 12, SSD1306_WHITE);
+
+    if (sent) {
+        display.setCursor(0, 25);
+        display.print("Weather: ALERT");
+
+        display.setCursor(0, 40);
+        display.print("Sending to modules...");
+    } else {
+        display.setCursor(0, 25);
+        display.print("Weather: CLEAR");
+
+        display.setCursor(0, 40);
+        display.print("Needs no transmission");
+    }
+
+    display.display();
+}
+
 void setup() {
     Serial.begin(115200);
     wakeCount++;
@@ -641,8 +668,6 @@ void setup() {
         Serial.println("  Skipped — too few valid samples");
     }
 
-    renderResultScreen();
-
     TelemetryRecord rec;
     rec.curTemp = curTemp;  rec.curHum = curHum;
     rec.curPres = curPres;   rec.curLux = curLux;
@@ -656,14 +681,13 @@ void setup() {
     saveToFlash(rec);
     Serial.printf("  Saved record #%u to NVS flash\n", wakeCount);
 
-    digitalWrite(SENSOR_POWER_PIN, LOW);
-
-    logSection("BLE Broadcast");
-    runBLE();
-
     logSection("ESP-NOW Transmission");
+    bool sent = false;
+
     if (weatherSev > 0) {
         sendEspNow(rec);
+        sent = true;
+
     } else {
         pinMode(CONFIRM_LED_PIN, OUTPUT);
         for(int i = 0; i < 3; i++) {
@@ -672,9 +696,21 @@ void setup() {
             digitalWrite(CONFIRM_LED_PIN, LOW);
             delay(150);
         }
-        Serial.println("  Skipped — weather is CLEAR, no transmission needed");
+        Serial.println("Skipped — weather is CLEAR, no transmission needed");
+        sent = false;
     }
 
+    renderTransmissionScreen(sent);
+
+    delay(6000);
+
+    renderResultScreen();
+
+    digitalWrite(SENSOR_POWER_PIN, LOW);
+
+    logSection("BLE Broadcast");
+    runBLE();
+    
     int sleepMin;
     switch (weatherSev) {
         case 3: sleepMin = SLEEP_SEVERE; break;
