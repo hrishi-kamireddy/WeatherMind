@@ -11,6 +11,31 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <math.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+struct WeatherResult {
+    const char* name;
+    const char* detail;
+    int severity;
+    const char* icon;
+};
+
+struct TelemetryRecord {
+    float curTemp, curHum, curPres, curLux;
+    float predTemp, predHum, predPres, predLux;
+    float pressureTrend;
+    int weatherSev;
+    char weatherName[20];
+    uint32_t wakeNum;
+};
+
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+    Serial.print("\r\nLast Packet Send Status:\t");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
 
 #define NN_HIDDEN1 16
 #define NN_HIDDEN2 8
@@ -23,15 +48,16 @@
 
 #define SENSOR_POWER_PIN 15
 #define DHT_PIN 4
-#define LIGHT_PIN 2
+#define LIGHT_PIN 34
+#define CONFIRM_LED_PIN   14
 
 #define SAMPLE_INTERVAL_MS 5000
 #define NUM_SAMPLES 12
-#define BLE_WINDOW_MS 15000
+#define BLE_WINDOW_MS 30000
 
 #define SLEEP_SEVERE 1
-#define SLEEP_MILD 5
-#define SLEEP_CLEAR 29
+#define SLEEP_MILD 1
+#define SLEEP_CLEAR 1
 
 #define SERVICE_UUID             "e3a1f0b0-1234-5678-abcd-000000000001"
 #define CHAR_CURRENT_UUID        "e3a1f0b0-1234-5678-abcd-000000000002"
@@ -43,15 +69,6 @@
 
 #define HISTORY_SLOTS 32
 #define NVS_NAMESPACE "wmind"
-
-struct TelemetryRecord {
-    float curTemp, curHum, curPres, curLux;
-    float predTemp, predHum, predPres, predLux;
-    float pressureTrend;
-    int weatherSev;
-    char weatherName[20];
-    uint32_t wakeNum;
-};
 
 struct KalmanFilter {
     float Q;
@@ -112,12 +129,7 @@ struct PressureTrend {
     }
 };
 
-struct WeatherResult {
-    const char* name;
-    const char* detail;
-    int severity;
-    const char* icon;
-};
+
 
 DHT dht(DHT_PIN, DHT11);
 Adafruit_BMP085 bmp;
@@ -240,17 +252,6 @@ WeatherResult classifyWeather(float tempC, float humPct,
     return {"CLEAR", "No severe weather indicators", 0, "CLR"};
 }
 
-// bool readSensors(float* temp, float* hum, float* pres, float* lux) {
-//     float t = dht.readTemperature();
-//     float h = dht.readHumidity();
-//     if (isnan(t) || isnan(h)) return false;
-//     if (t < -40.0f || t > 80.0f || h < 0.0f || h > 100.0f) return false;
-//     *temp = kf[0].update(t);
-//     *hum = kf[1].update(h);
-//     *pres = kf[2].update((float)bmp.readSealevelPressure(515));
-//     *lux = kf[3].update((float)analogRead(LIGHT_PIN));
-//     return true;
-// }
 bool readSensors(float* temp, float* hum, float* pres, float* lux) {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
@@ -275,33 +276,26 @@ void renderCollectingScreen(int sample, int total, float t, float h, float p, fl
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
-    // --- Header ---
-    // Clean top bar without the full-width inverse block for a lighter look
     display.setCursor(0, 0);
     display.print("WeatherMind");
     display.setCursor(80, 0);
     display.print("SAMPLING"); 
 
-    // --- Progress Bar ---
     int pct = sample * 100 / total;
-    drawProgressBar(0, 11, 128, 6, pct); // Slightly thinner bar
-    // Removed the text inside the bar for a cleaner visual flow
+    drawProgressBar(0, 11, 128, 6, pct);
 
-    // --- Live Sensor Data (Two-Column Layout) ---
-    // Row 1: Temp and Humidity
+    
     display.setCursor(0, 24);
     display.printf("T:%.1fC", t);
     display.setCursor(66, 24);
     display.printf("H:%.0f%%", h);
 
-    // Row 2: Pressure and Light
     display.setCursor(0, 34);
     display.printf("P:%.0fPa", p);
     display.setCursor(66, 34);
     display.printf("L:%.0f", l);
 
-    // --- Status Area ---
-    display.drawLine(0, 50, 127, 50, SSD1306_WHITE); // Divider
+    display.drawLine(0, 50, 127, 50, SSD1306_WHITE); 
     
     display.setCursor(0, 55);
     display.printf("Progress: %d/%d", sample, total);
@@ -328,27 +322,22 @@ void renderResultScreen() {
     display.setCursor(66, 0);
     display.printf("H:%.0f%%", curHum);
 
-    // Current P
     display.setCursor(0, 10);
     display.printf("P:%.0fPa", curPres);
 
-    // Divider with "30 min" label
     display.drawLine(0, 23, 127, 23, SSD1306_WHITE);
     display.fillRect(40, 20, 48, 7, SSD1306_BLACK);
     display.setCursor(43, 20);
     display.print("30 min");
 
-    // Predicted T + H
     display.setCursor(0, 30);
     display.printf("T:%.1fC", predTemp);
     display.setCursor(66, 30);
     display.printf("H:%.0f%%", predHum);
 
-    // Predicted P
     display.setCursor(0, 40);
     display.printf("P:%.0fPa", predPres);
 
-    // Status line with danger triangle if not clear
     display.setCursor(0, 54);
     display.print(">> ");
     display.print(weatherName);
@@ -386,7 +375,7 @@ int readHistory(TelemetryRecord* buf, int maxN) {
 
 void runBLE() {
     Serial.println("[BLE] Starting GATT server...");
-    BLEDevice::init("WeatherMind-Pro");
+    BLEDevice::init("WeatherMind");
     BLEServer* server = BLEDevice::createServer();
     BLEService* service = server->createService(SERVICE_UUID);
 
@@ -399,13 +388,13 @@ void runBLE() {
     };
 
     char curStr[64];
-    snprintf(curStr, sizeof(curStr), "T:%.1f H:%.0f P:%.1f L:%.0f",
-             curTemp, curHum, curPres / 100.0f, curLux);
+    snprintf(curStr, sizeof(curStr), "%.1f,%.0f,%.0f,%.0f",
+             curTemp, curHum, curPres, curLux);
     addChar(CHAR_CURRENT_UUID, curStr);
 
     char predStr[64];
-    snprintf(predStr, sizeof(predStr), "T:%.1f H:%.0f P:%.1f L:%.0f",
-             predTemp, predHum, predPres / 100.0f, curLux);
+    snprintf(predStr, sizeof(predStr), "%.1f,%.0f,%.0f,%.0f",
+             predTemp, predHum, predPres, curLux);
     addChar(CHAR_PREDICTED_UUID, predStr);
 
     char wStr[96];
@@ -452,6 +441,36 @@ void runBLE() {
 
 void logSection(const char* title) {
     Serial.printf("\n┌─────────────────────────────────────────\n│ %s\n└─────────────────────────────────────────\n", title);
+}
+
+void sendEspNow(const TelemetryRecord& data) {
+    pinMode(CONFIRM_LED_PIN, OUTPUT);
+    for(int i = 0; i < 5; i++) {
+        digitalWrite(CONFIRM_LED_PIN, HIGH);  
+        delay(150);
+        digitalWrite(CONFIRM_LED_PIN, LOW);
+        delay(150);
+    }
+    WiFi.mode(WIFI_STA);
+    if (esp_now_init() != ESP_OK) {
+        return;
+    }
+
+    esp_now_register_send_cb(OnDataSent);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        esp_now_send(broadcastAddress, (uint8_t*)&data, sizeof(data));
+    }
+
+    delay(200);
+    digitalWrite(CONFIRM_LED_PIN, LOW);
+
+    esp_now_deinit();
+    WiFi.mode(WIFI_OFF);
 }
 
 void setup() {
@@ -501,20 +520,16 @@ void setup() {
     display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
     display.setTextSize(1);
-    display.setCursor(32, 2); // Centered roughly
-    display.print("WEATHERMIND"); // Corrected typo from 'Weatherind'
+    display.setCursor(32, 2); 
+    display.print("WEATHERMIND"); 
 
-    // --- Main Content ---
     display.setTextColor(SSD1306_WHITE);
     
-    // Subtitle - slightly lower and centered
     display.setCursor(10, 28); 
     display.print("by Shadow Mechanics");
     
-    // Aesthetic Divider (matches your result screen style)
     display.drawLine(20, 39, 108, 39, SSD1306_WHITE);
 
-    // Wake Counter - smaller/subtle at the bottom
     display.setCursor(42, 45);
     display.printf("Session #%d", wakeCount);
 
@@ -645,6 +660,20 @@ void setup() {
 
     logSection("BLE Broadcast");
     runBLE();
+
+    logSection("ESP-NOW Transmission");
+    if (weatherSev > 0) {
+        sendEspNow(rec);
+    } else {
+        pinMode(CONFIRM_LED_PIN, OUTPUT);
+        for(int i = 0; i < 3; i++) {
+            digitalWrite(CONFIRM_LED_PIN, HIGH);
+            delay(150);
+            digitalWrite(CONFIRM_LED_PIN, LOW);
+            delay(150);
+        }
+        Serial.println("  Skipped — weather is CLEAR, no transmission needed");
+    }
 
     int sleepMin;
     switch (weatherSev) {
