@@ -1,0 +1,24 @@
+{
+  "features": [
+    "air_temp",
+    "humidity",
+    "pressure",
+    "lux",
+    "soil_moisture",
+    "soil_temp"
+  ],
+  "outputs": [
+    "min_temp_ahead",
+    "max_temp_ahead"
+  ],
+  "mae": {
+    "min_temp": 1.63272225856781,
+    "max_temp": 2.1837587356567383
+  },
+  "r2": {
+    "min_temp": 0.9648116230964661,
+    "max_temp": 0.9355259537696838
+  },
+  "frost_threshold_c": 2.0,
+  "heat_threshold_c": 35.0
+}
